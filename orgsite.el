@@ -241,20 +241,32 @@ etc.  Call once from your init.el:
   (require 'project)
   (add-hook 'project-find-functions #'orgsite-project-try))
 
+(defvar orgsite--last-loaded-site nil
+  "Absolute path of the `site.el' last loaded by the resolver.
+Prevents redundant reloads across successive calls in the same
+project.")
+
 (defun orgsite--resolve-paths ()
   "Fill derived path variables for the current project root.
 If the root has changed since the last resolve, reset the
 auto-derived paths first so they re-fill against the new root.
 Paths the user set explicitly (not via this function) are kept
-untouched across calls."
-  (let ((root (orgsite--detect-root)))
+untouched across calls.
+
+Also loads the project's `site.el' (the marker file) when it is
+found and hasn't been loaded for this root yet, so interactive
+commands like `M-x orgsite-build' see the same config as
+`emacs --batch -l build.el'."
+  (let* ((root (orgsite--detect-root))
+         (root-changed (not (equal root orgsite-project-root))))
     ;; Root moved?  Drop everything we previously auto-set so those
     ;; vars re-fill from the new root on this call.
-    (unless (equal root orgsite-project-root)
+    (when root-changed
       (dolist (sym orgsite--auto-set-paths)
         (set sym nil))
       (setq orgsite--auto-set-paths nil
             orgsite-project-root root))
+    ;; Fill derived dirs.
     (dolist (pair '((orgsite-content-dir   . "content")
                     (orgsite-output-dir    . "dist")
                     (orgsite-assets-dir    . "assets")
@@ -263,7 +275,18 @@ untouched across calls."
       (let ((sym (car pair)) (sub (cdr pair)))
         (unless (symbol-value sym)
           (set sym (expand-file-name sub root))
-          (push sym orgsite--auto-set-paths))))))
+          (push sym orgsite--auto-set-paths))))
+    ;; Load the project's site.el, but *without* re-triggering a
+    ;; build -- bind `orgsite-build' to a no-op while loading so an
+    ;; explicit `(orgsite-build)' call at the bottom of site.el
+    ;; doesn't recurse.
+    (let ((site (expand-file-name orgsite-project-marker root)))
+      (when (and (file-readable-p site)
+                 (or root-changed
+                     (not (equal site orgsite--last-loaded-site))))
+        (cl-letf (((symbol-function 'orgsite-build) #'ignore))
+          (load site nil t t))
+        (setq orgsite--last-loaded-site site)))))
 
 (defvar orgsite-output-format 'pretty
   "How to format HTML before writing.
