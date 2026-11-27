@@ -60,23 +60,35 @@
 ;; project root "just works" without any configuration, as long as
 ;; the project uses the standard `content/' + `assets/' layout.
 
-(defvar orgsite-content-dir
-  (expand-file-name "content" default-directory)
-  "Directory that holds the source `.org' files.")
+(defvar orgsite-project-marker "site.el"
+  "Filename that marks the root of an orgsite project.
+`orgsite-project-root' walks up from `default-directory' looking
+for a file with this name, the way LSP servers find a workspace
+root.")
 
-(defvar orgsite-output-dir
-  (expand-file-name "dist" default-directory)
+(defvar orgsite-project-root nil
+  "Absolute path of the current project root, or nil.
+When nil, orgsite looks it up on demand via
+`orgsite-project-root'.  Set it explicitly from `site.el' only
+when you want to override the auto-detection.")
+
+(defvar orgsite-content-dir nil
+  "Directory that holds the source `.org' files.
+When nil, resolves to `<project-root>/content' at build time.")
+
+(defvar orgsite-output-dir nil
   "Directory where the built HTML is written.
+When nil, resolves to `<project-root>/dist' at build time.
 Safe to delete between builds; the build will recreate it.")
 
-(defvar orgsite-assets-dir
-  (expand-file-name "assets" default-directory)
+(defvar orgsite-assets-dir nil
   "Directory of static files copied verbatim into the output as `assets/'.
+When nil, resolves to `<project-root>/assets' at build time.
 Skipped silently if the directory does not exist.")
 
-(defvar orgsite-public-dir
-  (expand-file-name "public" default-directory)
+(defvar orgsite-public-dir nil
   "Directory copied verbatim into the ROOT of the output dir.
+When nil, resolves to `<project-root>/public' at build time.
 Use for files that must live at the site root --- `favicon.ico',
 `robots.txt', `cv.pdf', etc.  Skipped silently when missing.")
 
@@ -151,9 +163,9 @@ Set to nil for no cap.")
 Defaults to `#+LAYOUT: post'.  Change to broaden or narrow the
 feed (e.g. include a specific section only).")
 
-(defvar orgsite-templates-dir
-  (expand-file-name "templates" default-directory)
+(defvar orgsite-templates-dir nil
   "User template directory.
+When nil, resolves to `<project-root>/templates' at build time.
 Looked up first by `orgsite--find-template'; falls back to the
 package's built-in templates when a file is not found here.")
 
@@ -164,6 +176,38 @@ package's built-in templates when a file is not found here.")
   "Directory of templates shipped with the orgsite package.
 Serves as the fallback when a template is missing from
 `orgsite-templates-dir'.")
+
+(defun orgsite-project-root ()
+  "Return the current project root, auto-detecting if needed.
+Checks `orgsite-project-root'; if nil, walks up from
+`default-directory' looking for a file named
+`orgsite-project-marker' (default `site.el').  Falls back to
+`default-directory' with a warning so running from a fresh
+directory still builds something."
+  (or orgsite-project-root
+      (let ((root (locate-dominating-file default-directory
+                                          orgsite-project-marker)))
+        (if root
+            (expand-file-name root)
+          (prog1 (expand-file-name default-directory)
+            (message "orgsite: no `%s' found above `%s'; using cwd"
+                     orgsite-project-marker default-directory))))))
+
+(defun orgsite--resolve-paths ()
+  "Fill the nil path variables relative to the project root.
+A no-op for any variable the user has already set explicitly."
+  (let ((root (orgsite-project-root)))
+    (setq orgsite-project-root root)
+    (unless orgsite-content-dir
+      (setq orgsite-content-dir (expand-file-name "content" root)))
+    (unless orgsite-output-dir
+      (setq orgsite-output-dir (expand-file-name "dist" root)))
+    (unless orgsite-assets-dir
+      (setq orgsite-assets-dir (expand-file-name "assets" root)))
+    (unless orgsite-public-dir
+      (setq orgsite-public-dir (expand-file-name "public" root)))
+    (unless orgsite-templates-dir
+      (setq orgsite-templates-dir (expand-file-name "templates" root)))))
 
 (defvar orgsite-output-format 'pretty
   "How to format HTML before writing.
@@ -1097,6 +1141,7 @@ STATUS is a string like \"200 OK\".  HEADERS is an alist of
 Idempotent: if a server is already running, this just prints its
 address."
   (interactive)
+  (orgsite--resolve-paths)
   (if (and orgsite--server-process
            (process-live-p orgsite--server-process))
       (message "orgsite: already serving at http://%s:%d/"
@@ -1203,6 +1248,7 @@ Smooths over editors that fire many events per save.")
   "Start watching content / templates / assets and rebuild on change.
 Idempotent: if already watching, prints the current status."
   (interactive)
+  (orgsite--resolve-paths)
   (if orgsite--watch-descriptors
       (message "orgsite-watch: already watching (%d descriptors)"
                (length orgsite--watch-descriptors))
@@ -1237,6 +1283,7 @@ Runs `orgsite-pre-build-hook' before loading content, and
 Idempotent: existing files are overwritten.  Obsolete files are
 left behind --- call `orgsite-clean' first if that matters."
   (interactive)
+  (orgsite--resolve-paths)
   (run-hooks 'orgsite-pre-build-hook)
   (message "orgsite: building into %s" orgsite-output-dir)
   (make-directory orgsite-output-dir t)
@@ -1264,6 +1311,7 @@ left behind --- call `orgsite-clean' first if that matters."
 Removes obsolete files left behind by renames or deletions.
 Prompts for confirmation when called interactively."
   (interactive)
+  (orgsite--resolve-paths)
   (if (not (file-directory-p orgsite-output-dir))
       (message "orgsite: nothing to clean (%s does not exist)"
                orgsite-output-dir)
