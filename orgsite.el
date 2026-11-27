@@ -1138,7 +1138,10 @@ when the target is a directory."
 (defun orgsite--serve-send (proc status headers body)
   "Write an HTTP/1.0 response to PROC.
 STATUS is a string like \"200 OK\".  HEADERS is an alist of
-\(NAME . VALUE) pairs.  BODY is a unibyte string."
+\(NAME . VALUE) pairs.  BODY is a unibyte string.
+Writes are guarded so a client that aborts mid-response (common
+with browsers reloading an open SSE connection) does not raise
+a filter error."
   (let ((head (concat
                (format "HTTP/1.0 %s\r\n" status)
                (mapconcat (lambda (h)
@@ -1147,10 +1150,10 @@ STATUS is a string like \"200 OK\".  HEADERS is an alist of
                           "")
                (format "Content-Length: %d\r\n" (length body))
                "Connection: close\r\n\r\n")))
-    ;; Headers first (multibyte string ok), then raw body.  We send
-    ;; the body with a unibyte write by concatenating a unibyte head.
-    (process-send-string proc head)
-    (process-send-string proc body)))
+    ;; Headers first (multibyte string ok), then raw body.  Guard both
+    ;; writes --- the peer may already be gone.
+    (ignore-errors (process-send-string proc head))
+    (ignore-errors (process-send-string proc body))))
 
 (defun orgsite--serve-404 (proc url-path)
   "Send a 404 response and log it."
@@ -1205,19 +1208,25 @@ Dead processes are pruned opportunistically."
       (setq orgsite--sse-clients (delq p orgsite--sse-clients)))))
 
 (defun orgsite--sse-attach (proc)
-  "Promote PROC to a long-lived SSE connection."
-  (process-send-string
-   proc
-   (concat "HTTP/1.0 200 OK\r\n"
-           "Content-Type: text/event-stream\r\n"
-           "Cache-Control: no-cache\r\n"
-           "Connection: keep-alive\r\n\r\n"
-           ": connected\n\n"))
-  (push proc orgsite--sse-clients)
-  (set-process-sentinel
-   proc
-   (lambda (p _event)
-     (setq orgsite--sse-clients (delq p orgsite--sse-clients)))))
+  "Promote PROC to a long-lived SSE connection.
+Opens the stream with a 200 response + a `: connected' comment
+line and registers PROC with `orgsite--sse-clients'.  The write
+is guarded: a client that disconnects instantly must not raise
+inside the filter."
+  (when (ignore-errors
+          (process-send-string
+           proc
+           (concat "HTTP/1.0 200 OK\r\n"
+                   "Content-Type: text/event-stream\r\n"
+                   "Cache-Control: no-cache\r\n"
+                   "Connection: keep-alive\r\n\r\n"
+                   ": connected\n\n"))
+          t)
+    (push proc orgsite--sse-clients)
+    (set-process-sentinel
+     proc
+     (lambda (p _event)
+       (setq orgsite--sse-clients (delq p orgsite--sse-clients))))))
 
 (defun orgsite--serve-livereload-post-build ()
   "Broadcast a reload event; registered on `orgsite-post-build-hook'."
