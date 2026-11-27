@@ -1,13 +1,13 @@
 <!DOCTYPE html>
 <html lang="en">
-@(orgsite--head page)
+@(orgsite-head page)
   <body>
     @(orgsite-partial "nav.html" page)
     <main id="content">
       @(orgsite-partial "post-header.html" page)
-      <article class="post-body">
+      <div class="post-body">
         @(orgsite-page-body page)
-      </article>
+      </div>
     </main>
     @(orgsite-partial "footer.html" page)
   </body>

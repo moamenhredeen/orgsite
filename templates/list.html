@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="en">
+@(orgsite-head page)
+  <body>
+    @(orgsite-partial "nav.html" page)
+    <main id="content">
+      @(orgsite-partial "post-header.html" page)
+      <div class="post-body">
+        @(orgsite-page-body page)
+        @(orgsite-tmpl-render-file "posts-list.html"
+           `((page . ,page)
+             (posts . ,(orgsite-posts :section (orgsite-page-section page)))))
+      </div>
+    </main>
+    @(orgsite-partial "footer.html" page)
+  </body>
+</html>

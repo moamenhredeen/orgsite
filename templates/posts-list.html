@@ -1,0 +1,9 @@
+<section class="posts-list">
+  <ul>
+    @(mapconcat (lambda (post)
+                  (orgsite-tmpl-render-file "post-entry.html"
+                                            `((post . ,post))))
+                (or posts (orgsite-posts))
+                "\n")
+  </ul>
+</section>

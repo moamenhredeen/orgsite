@@ -1,0 +1,8 @@
+<li class="post-entry">
+  @(when (orgsite-page-date post)
+     (format "<time class=\"post-entry-date\" datetime=\"%s\">%s</time>"
+             (orgsite-page-date post)
+             (orgsite-format-date (orgsite-page-date post))))
+  <a class="post-entry-link" href="@(orgsite-page-url post)">@(orgsite-escape (orgsite-page-title post))</a>
+  <p class="post-entry-description">@(orgsite-escape (or (orgsite-page-description post) ""))</p>
+</li>

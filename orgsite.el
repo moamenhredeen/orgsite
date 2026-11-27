@@ -1,10 +1,13 @@
 ;;; orgsite.el --- Static site generator for Org files -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Moamen Hredeen
+
 ;; Author: Moamen Hredeen
-;; Version: 0.1.0
-;; Package-Requires: ((emacs "28.1"))
+;; Version: 0.2.0
+;; Package-Requires: ((emacs "28.1") (seq "2.0"))
 ;; Keywords: hypermedia, outlines, org
 ;; URL: https://github.com/moamenhredeen/orgsite
+;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;;; Commentary:
 ;;
@@ -512,6 +515,49 @@ works because dates are stored as ISO `YYYY-MM-DD'."
   "Return the subset of PAGES whose TAGS list contains TAG string."
   (seq-filter (lambda (p) (member tag (orgsite-page-tags p))) pages))
 
+(defun orgsite-page-permalink (page)
+  "Return the fully-qualified canonical URL of PAGE.
+Concatenates `orgsite-site-url' with the page's root-relative
+URL.  Useful for RSS <link>, <guid>, OpenGraph `og:url', and
+anywhere an absolute URL is required."
+  (concat orgsite-site-url (orgsite-page-url page)))
+
+(cl-defun orgsite-posts (&key (pages orgsite--all-pages)
+                              (layout 'post)
+                              section
+                              tag
+                              include-drafts
+                              (sort t)
+                              limit)
+  "Return a list of post pages, filtered and sorted for listings.
+
+Keyword arguments:
+  :PAGES          source list, defaults to the dynamic `pages'.
+  :LAYOUT         layout symbol to match; default `post', nil = any.
+  :SECTION        restrict to a top-level section (e.g. \"blog\").
+  :TAG            restrict to pages carrying this tag string.
+  :INCLUDE-DRAFTS keep pages with `#+STATUS: draft'; default off.
+  :SORT           t to sort newest-first, `ascending' for oldest-first,
+                  nil to leave in load order.
+  :LIMIT          integer to cap the list length, or nil for all.
+
+The single call covers the common patterns (`latest N posts',
+`every post in section', `posts tagged X')."
+  (let* ((xs pages)
+         (xs (if layout (orgsite-filter-by-layout xs layout) xs))
+         (xs (if section
+                 (seq-filter (lambda (p)
+                               (equal (orgsite-page-section p) section))
+                             xs)
+               xs))
+         (xs (if tag (orgsite-filter-by-tag xs tag) xs))
+         (xs (if include-drafts xs (orgsite-reject-by-status xs "draft")))
+         (xs (pcase sort
+               ('ascending (orgsite-sort-by-date xs t))
+               ('nil xs)
+               (_ (orgsite-sort-by-date xs)))))
+    (if limit (seq-take xs limit) xs)))
+
 (defun orgsite-filter-by-status (pages status)
   "Return the subset of PAGES whose STATUS slot equals STATUS string."
   (seq-filter (lambda (p) (equal (orgsite-page-status p) status)) pages))
@@ -522,21 +568,37 @@ Handy for excluding drafts from listings: pass \"draft\" and the
 remaining pages are everything else."
   (seq-remove (lambda (p) (equal (orgsite-page-status p) status)) pages))
 
+(defun orgsite--parse-iso-date (iso)
+  "Return an Emacs time value for ISO `YYYY-MM-DD' string, or nil.
+Uses `parse-time-string', so malformed input fails safely rather
+than silently returning 1970-01-01.  Timezone is pinned to UTC
+to keep dates stable across builders in different zones."
+  (when (and iso (not (string-empty-p iso)))
+    (let ((parsed (parse-time-string iso)))
+      ;; parse-time-string fills missing fields with nil; require
+      ;; at least year + month + day to accept the date.
+      (when (and (nth 3 parsed) (nth 4 parsed) (nth 5 parsed))
+        (encode-time 0 0 0
+                     (nth 3 parsed) (nth 4 parsed) (nth 5 parsed)
+                     nil 0)))))
+
 (defun orgsite-format-date (iso)
   "Format an ISO date string with `orgsite-date-format'.
 ISO is a string like `2025-06-23' as parsed from `#+DATE:'.
-Returns an empty string when ISO is nil or empty, so missing
-dates render as blanks instead of \"nil\" or an error."
-  (if (or (null iso) (string-empty-p iso))
-      ""
-    (format-time-string
-     orgsite-date-format
-     (date-to-time (concat iso "T00:00:00")))))
+Returns an empty string when ISO is nil, empty, or unparseable."
+  (if-let* ((time (orgsite--parse-iso-date iso)))
+      (format-time-string orgsite-date-format time)
+    ""))
 
 (defvar orgsite--all-pages nil
-  "Dynamic binding of every loaded page.
-Set by the pipeline during the write phase so templates can see
-the full site via the `pages' environment variable.")
+  "Dynamic binding of every page in the current build.
+Bound by `orgsite-build' around the synthetic + render + write
+phases, so hook functions and templates all see the same `pages'
+list.  Starts out with just the loaded pages during the
+synthetic-page generation step, then widens to include synthetic
+pages before rendering --- this way a synthetic generator that
+renders a partial of its own still sees the loaded pages, while
+regular templates see everything.")
 
 (defun orgsite-page-section (page)
   "Return the top-level section of PAGE as a string, or nil.
@@ -628,15 +690,16 @@ page list inline."
       (replace-regexp-in-string ">" "&gt;" s)))))
 
 (defun orgsite--rfc822-date (iso)
-  "Convert an ISO `YYYY-MM-DD' string to an RFC 822 date for RSS."
-  (format-time-string "%a, %d %b %Y 00:00:00 +0000"
-                      (date-to-time (concat iso "T00:00:00"))))
+  "Convert an ISO `YYYY-MM-DD' string to an RFC 822 date for RSS.
+Returns nil on malformed input so the caller can omit the
+element rather than emit a broken timestamp."
+  (when-let* ((time (orgsite--parse-iso-date iso)))
+    (format-time-string "%a, %d %b %Y 00:00:00 +0000" time)))
 
 (defun orgsite--sitemap-entry (page)
   "Return a single <url> element for PAGE."
-  (format "  <url>\n    <loc>%s%s</loc>%s\n  </url>"
-          orgsite-site-url
-          (orgsite-page-url page)
+  (format "  <url>\n    <loc>%s</loc>%s\n  </url>"
+          (orgsite-page-permalink page)
           (if (orgsite-page-date page)
               (format "\n    <lastmod>%s</lastmod>" (orgsite-page-date page))
             "")))
@@ -661,20 +724,21 @@ the sitemap itself) are excluded."
      :body xml)))
 
 (defun orgsite--rss-item (post)
-  "Return a single <item> element for POST."
-  (let ((url (concat orgsite-site-url (orgsite-page-url post))))
+  "Return a single <item> element for POST.
+Omits <pubDate> when the post has no date, which keeps the feed
+valid for strict validators."
+  (let ((url (orgsite-page-permalink post)))
     (format "    <item>
       <title>%s</title>
       <link>%s</link>
-      <guid isPermaLink=\"true\">%s</guid>
-      <pubDate>%s</pubDate>
+      <guid isPermaLink=\"true\">%s</guid>%s
       <description>%s</description>
     </item>"
             (orgsite--xml-escape (orgsite-page-title post))
             url
             url
-            (if (orgsite-page-date post)
-                (orgsite--rfc822-date (orgsite-page-date post))
+            (if-let* ((rfc (orgsite--rfc822-date (orgsite-page-date post))))
+                (format "\n      <pubDate>%s</pubDate>" rfc)
               "")
             (orgsite--xml-escape (orgsite-page-description post)))))
 
@@ -737,35 +801,18 @@ Quirk: breaks inline tags (<a>, <title>) onto new lines."
     (sgml-pretty-print (point-min) (point-max))
     (buffer-string)))
 
-(defun orgsite--format-libxml-fix-pre (html)
-  "Strip pretty-print indentation that `dom-print' injected into <pre>.
-`dom-print' indents every child element, including the <code>
-inside <pre>.  <pre> preserves whitespace, so that indent shows
-up as a visible leading gap on the first line of every code
-block.  We rewrite each `<pre>...</pre>' block: trim the
-<code>'s own indent and dedent each line uniformly."
-  (with-temp-buffer
-    (insert html)
-    (goto-char (point-min))
-    (while (re-search-forward "<pre\\([^>]*\\)>\\([^\0]*?\\)</pre>" nil t)
-      (let* ((attrs (match-string 1))
-             (inner (match-string 2))
-             ;; Drop leading/trailing whitespace between <pre> and
-             ;; <code>, and between </code> and </pre>.
-             (trimmed (replace-regexp-in-string
-                       "\\`[ \t\n]*\\(<code[^>]*>\\)[ \t\n]*" "\\1"
-                       (replace-regexp-in-string
-                        "[ \t\n]*\\(</code>\\)[ \t\n]*\\'" "\\1"
-                        inner))))
-        (replace-match (format "<pre%s>%s</pre>" attrs trimmed) t t)))
-    (buffer-string)))
-
 (defun orgsite--format-libxml (html)
   "Return HTML round-tripped through libxml + `dom-print'.
-Handles inline elements correctly.  Requires Emacs built with
-libxml2 support (true for mainstream distros, macOS Homebrew,
-and Windows GNU builds).  Post-processes <pre><code> blocks to
-remove indentation that would otherwise print as a leading gap."
+Requires Emacs built with libxml2 support (true for mainstream
+distros, macOS Homebrew, and Windows GNU builds).
+
+We call `dom-print' with pretty-print DISABLED on purpose.  When
+pretty-print is on, dom-print indents every child element,
+including `<code>' inside `<pre>' --- and `<pre>' preserves
+whitespace, so that indent renders as a visible leading gap in
+every code block.  Shipping a single-line document is both
+smaller and avoids a whole class of markup bugs; browsers and
+view-source users don't care."
   (unless (fboundp 'libxml-parse-html-region)
     (error "orgsite: libxml2 support required for `libxml' format"))
   (with-temp-buffer
@@ -773,8 +820,8 @@ remove indentation that would otherwise print as a leading gap."
     (let ((dom (libxml-parse-html-region (point-min) (point-max))))
       (erase-buffer)
       (insert "<!DOCTYPE html>\n")
-      (dom-print dom t)
-      (orgsite--format-libxml-fix-pre (buffer-string)))))
+      (dom-print dom nil)
+      (buffer-string))))
 
 (defun orgsite--format-html (html)
   "Dispatch HTML through the formatter chosen by `orgsite-output-format'.
@@ -845,10 +892,9 @@ sitemaps and feeds need."
 
 (defun orgsite--write-pages (pages)
   "Write every page in PAGES to disk.
-Dynamically binds `orgsite--all-pages' so template env has the
-full site list available as `pages'."
-  (let ((orgsite--all-pages pages))
-    (mapc #'orgsite--write-page pages)))
+`orgsite--all-pages' is bound by `orgsite-build' around the whole
+pipeline, so templates see the full page list as `pages'."
+  (mapc #'orgsite--write-page pages))
 
 (defun orgsite--copy-assets ()
   "Copy the assets directory into the output as `dist/assets/'.
@@ -1101,8 +1147,15 @@ matters."
   (message "orgsite: building into %s" orgsite-output-dir)
   (make-directory orgsite-output-dir t)
   (let* ((sources (orgsite--discover-sources))
-         (pages (orgsite--load-pages sources))
-         (all (orgsite--generate-synthetic pages)))
+         (loaded (orgsite--load-pages sources))
+         ;; Bind the dynamic `pages' list for the whole pipeline.
+         ;; Starts with just the loaded pages so hook functions can
+         ;; render partials that reference `pages' without surprise.
+         (orgsite--all-pages loaded)
+         (all (orgsite--generate-synthetic loaded)))
+    ;; Widen the binding to include synthetic pages before render +
+    ;; write, so regular templates see the complete list.
+    (setq orgsite--all-pages all)
     (orgsite--render-pages all)
     (orgsite--write-pages all)
     (orgsite--copy-assets)
