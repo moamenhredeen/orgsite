@@ -193,21 +193,77 @@ directory still builds something."
             (message "orgsite: no `%s' found above `%s'; using cwd"
                      orgsite-project-marker default-directory))))))
 
+(defvar orgsite--auto-set-paths nil
+  "List of path variable symbols that orgsite derived itself.
+Used by `orgsite--resolve-paths' to re-derive paths when the
+project root changes (e.g. the user runs `orgsite-serve' from a
+second project in the same Emacs session) without clobbering
+anything the user set explicitly.")
+
+(defun orgsite--detect-root ()
+  "Return the project root for the current `default-directory'.
+Walks up looking for `orgsite-project-marker'.  Falls back to
+`default-directory' with a warning."
+  (let ((root (locate-dominating-file default-directory
+                                      orgsite-project-marker)))
+    (if root
+        (expand-file-name root)
+      (prog1 (expand-file-name default-directory)
+        (message "orgsite: no `%s' found above `%s'; using cwd"
+                 orgsite-project-marker default-directory)))))
+
+;;;###autoload
+(defun orgsite-project-try (dir)
+  "Backend for `project-find-functions'.
+Returns a project descriptor when DIR is inside an orgsite
+project (i.e. has `orgsite-project-marker' in an ancestor dir).
+Registered via `orgsite-project-enable'.
+
+See `project-root' and friends from Emacs' built-in `project'
+library for the full API."
+  (when-let* ((root (locate-dominating-file dir orgsite-project-marker)))
+    (cons 'orgsite (expand-file-name root))))
+
+(cl-defmethod project-root ((project (head orgsite)))
+  "Return the root directory of an orgsite PROJECT."
+  (cdr project))
+
+;;;###autoload
+(defun orgsite-project-enable ()
+  "Register orgsite as a `project.el' backend.
+After calling this, any directory containing a `site.el' is
+recognized by `project-current', `project-find-file' (C-x p f),
+etc.  Call once from your init.el:
+
+  (with-eval-after-load \\='project
+    (orgsite-project-enable))"
+  (interactive)
+  (require 'project)
+  (add-hook 'project-find-functions #'orgsite-project-try))
+
 (defun orgsite--resolve-paths ()
-  "Fill the nil path variables relative to the project root.
-A no-op for any variable the user has already set explicitly."
-  (let ((root (orgsite-project-root)))
-    (setq orgsite-project-root root)
-    (unless orgsite-content-dir
-      (setq orgsite-content-dir (expand-file-name "content" root)))
-    (unless orgsite-output-dir
-      (setq orgsite-output-dir (expand-file-name "dist" root)))
-    (unless orgsite-assets-dir
-      (setq orgsite-assets-dir (expand-file-name "assets" root)))
-    (unless orgsite-public-dir
-      (setq orgsite-public-dir (expand-file-name "public" root)))
-    (unless orgsite-templates-dir
-      (setq orgsite-templates-dir (expand-file-name "templates" root)))))
+  "Fill derived path variables for the current project root.
+If the root has changed since the last resolve, reset the
+auto-derived paths first so they re-fill against the new root.
+Paths the user set explicitly (not via this function) are kept
+untouched across calls."
+  (let ((root (orgsite--detect-root)))
+    ;; Root moved?  Drop everything we previously auto-set so those
+    ;; vars re-fill from the new root on this call.
+    (unless (equal root orgsite-project-root)
+      (dolist (sym orgsite--auto-set-paths)
+        (set sym nil))
+      (setq orgsite--auto-set-paths nil
+            orgsite-project-root root))
+    (dolist (pair '((orgsite-content-dir   . "content")
+                    (orgsite-output-dir    . "dist")
+                    (orgsite-assets-dir    . "assets")
+                    (orgsite-public-dir    . "public")
+                    (orgsite-templates-dir . "templates")))
+      (let ((sym (car pair)) (sub (cdr pair)))
+        (unless (symbol-value sym)
+          (set sym (expand-file-name sub root))
+          (push sym orgsite--auto-set-paths))))))
 
 (defvar orgsite-output-format 'pretty
   "How to format HTML before writing.
