@@ -110,6 +110,34 @@ list of additional `orgsite-page' structs (possibly empty).
 Called after loading, before rendering.  Use this to build
 listings, archives, category indexes, feeds, etc.")
 
+;;; --------------------------------------- sitemap + RSS auto-generation
+
+(defvar orgsite-generate-sitemap t
+  "When non-nil, orgsite auto-emits `/sitemap.xml' for every build.
+Set to nil to disable or to fully override via
+`orgsite-synthetic-pages-functions'.")
+
+(defvar orgsite-sitemap-output "sitemap.xml"
+  "Relative output path (under dist/) for the auto-generated sitemap.")
+
+(defvar orgsite-generate-rss t
+  "When non-nil, orgsite auto-emits an RSS 2.0 feed of the latest posts.
+Set to nil to disable.")
+
+(defvar orgsite-rss-output "rss.xml"
+  "Relative output path (under dist/) for the auto-generated RSS feed.
+Default puts it at the site root; set to e.g. \"blog/rss.xml\" to
+place it under a section.")
+
+(defvar orgsite-rss-limit 20
+  "Maximum number of items included in the auto-generated RSS feed.")
+
+(defvar orgsite-rss-filter
+  (lambda (p) (eq (orgsite-page-layout p) 'post))
+  "Predicate selecting which pages belong in the RSS feed.
+Defaults to `#+LAYOUT: post'.  Change to broaden or narrow the
+feed (e.g. include a specific section only).")
+
 (defvar orgsite-templates-dir
   (expand-file-name "templates" default-directory)
   "User template directory.
@@ -170,11 +198,16 @@ Slots:
                   Typical values: \"draft\", \"published\", \"archived\".
                   Not interpreted by the package; use
                   `orgsite-filter-by-status' in your site code.
+  RAW          -- when non-nil, the page's BODY is written to disk
+                  verbatim: no template wrapping, no HTML formatter
+                  pass.  Use this for XML artefacts like sitemaps and
+                  RSS feeds.
   BODY         -- rendered inner HTML.  Filled later by the renderer."
   slug source-path output-path
   title description kicker date author tags
   (layout 'page)
   status
+  raw
   body)
 
 (defun orgsite--keyword (keywords name)
@@ -574,6 +607,122 @@ page list inline."
      (pages . ,orgsite--all-pages))))
 
 
+;;;; =================================================== Sitemap + RSS
+
+;; Optional, auto-registered generators for `/sitemap.xml' and an RSS
+;; 2.0 feed.  Both are controlled by `orgsite-generate-sitemap' and
+;; `orgsite-generate-rss' and inserted into the pipeline by
+;; `orgsite--auto-synthetic-pages' so users don't have to add a hook.
+;; Users keep full control by (a) setting the vars to nil, (b)
+;; overriding the related vars (output path, filter, limit), or
+;; (c) adding their own hook function.
+
+(defun orgsite--xml-escape (s)
+  "Escape S for inclusion as XML text content."
+  (if (null s)
+      ""
+    (replace-regexp-in-string
+     "&" "&amp;"
+     (replace-regexp-in-string
+      "<" "&lt;"
+      (replace-regexp-in-string ">" "&gt;" s)))))
+
+(defun orgsite--rfc822-date (iso)
+  "Convert an ISO `YYYY-MM-DD' string to an RFC 822 date for RSS."
+  (format-time-string "%a, %d %b %Y 00:00:00 +0000"
+                      (date-to-time (concat iso "T00:00:00"))))
+
+(defun orgsite--sitemap-entry (page)
+  "Return a single <url> element for PAGE."
+  (format "  <url>\n    <loc>%s%s</loc>%s\n  </url>"
+          orgsite-site-url
+          (orgsite-page-url page)
+          (if (orgsite-page-date page)
+              (format "\n    <lastmod>%s</lastmod>" (orgsite-page-date page))
+            "")))
+
+(defun orgsite-sitemap-page (pages)
+  "Return an `orgsite-page' representing /sitemap.xml for PAGES.
+Includes every page except drafts.  Synthetic raw pages (feeds,
+the sitemap itself) are excluded."
+  (let* ((live (seq-remove (lambda (p)
+                             (or (orgsite-page-raw p)
+                                 (equal (orgsite-page-status p) "draft")))
+                           pages))
+         (entries (mapconcat #'orgsite--sitemap-entry live "\n"))
+         (xml (concat "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                      "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n"
+                      entries
+                      "\n</urlset>\n")))
+    (make-orgsite-page
+     :slug "sitemap"
+     :output-path (expand-file-name orgsite-sitemap-output orgsite-output-dir)
+     :raw t
+     :body xml)))
+
+(defun orgsite--rss-item (post)
+  "Return a single <item> element for POST."
+  (let ((url (concat orgsite-site-url (orgsite-page-url post))))
+    (format "    <item>
+      <title>%s</title>
+      <link>%s</link>
+      <guid isPermaLink=\"true\">%s</guid>
+      <pubDate>%s</pubDate>
+      <description>%s</description>
+    </item>"
+            (orgsite--xml-escape (orgsite-page-title post))
+            url
+            url
+            (if (orgsite-page-date post)
+                (orgsite--rfc822-date (orgsite-page-date post))
+              "")
+            (orgsite--xml-escape (orgsite-page-description post)))))
+
+(defun orgsite-rss-page (pages)
+  "Return an `orgsite-page' representing the RSS feed for PAGES.
+Honours `orgsite-rss-filter', `orgsite-rss-limit', and
+`orgsite-rss-output'."
+  (let* ((candidates (seq-filter orgsite-rss-filter pages))
+         (posts (seq-take
+                 (orgsite-sort-by-date
+                  (seq-remove (lambda (p)
+                                (equal (orgsite-page-status p) "draft"))
+                              candidates))
+                 orgsite-rss-limit))
+         (items (mapconcat #'orgsite--rss-item posts "\n"))
+         (feed-link (concat orgsite-site-url
+                            "/" (or (file-name-directory orgsite-rss-output)
+                                    "")))
+         (xml (concat "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                      "<rss version=\"2.0\">\n"
+                      "  <channel>\n"
+                      (format "    <title>%s</title>\n"
+                              (orgsite--xml-escape orgsite-site-title))
+                      (format "    <link>%s</link>\n" feed-link)
+                      (format "    <description>%s</description>\n"
+                              (orgsite--xml-escape orgsite-site-description))
+                      "    <language>en</language>\n"
+                      items (if (length> items 0) "\n" "")
+                      "  </channel>\n"
+                      "</rss>\n")))
+    (make-orgsite-page
+     :slug (file-name-sans-extension orgsite-rss-output)
+     :output-path (expand-file-name orgsite-rss-output orgsite-output-dir)
+     :raw t
+     :body xml)))
+
+(defun orgsite--auto-synthetic-pages (pages)
+  "Return auto-registered synthetic pages controlled by vars.
+Sitemap and RSS are each toggleable via
+`orgsite-generate-sitemap' and `orgsite-generate-rss'."
+  (let (result)
+    (when orgsite-generate-sitemap
+      (push (orgsite-sitemap-page pages) result))
+    (when orgsite-generate-rss
+      (push (orgsite-rss-page pages) result))
+    (nreverse result)))
+
+
 ;;;; ============================================================ Format
 
 ;; Optional pass applied to each page's full HTML just before it is
@@ -588,11 +737,35 @@ Quirk: breaks inline tags (<a>, <title>) onto new lines."
     (sgml-pretty-print (point-min) (point-max))
     (buffer-string)))
 
+(defun orgsite--format-libxml-fix-pre (html)
+  "Strip pretty-print indentation that `dom-print' injected into <pre>.
+`dom-print' indents every child element, including the <code>
+inside <pre>.  <pre> preserves whitespace, so that indent shows
+up as a visible leading gap on the first line of every code
+block.  We rewrite each `<pre>...</pre>' block: trim the
+<code>'s own indent and dedent each line uniformly."
+  (with-temp-buffer
+    (insert html)
+    (goto-char (point-min))
+    (while (re-search-forward "<pre\\([^>]*\\)>\\([^\0]*?\\)</pre>" nil t)
+      (let* ((attrs (match-string 1))
+             (inner (match-string 2))
+             ;; Drop leading/trailing whitespace between <pre> and
+             ;; <code>, and between </code> and </pre>.
+             (trimmed (replace-regexp-in-string
+                       "\\`[ \t\n]*\\(<code[^>]*>\\)[ \t\n]*" "\\1"
+                       (replace-regexp-in-string
+                        "[ \t\n]*\\(</code>\\)[ \t\n]*\\'" "\\1"
+                        inner))))
+        (replace-match (format "<pre%s>%s</pre>" attrs trimmed) t t)))
+    (buffer-string)))
+
 (defun orgsite--format-libxml (html)
   "Return HTML round-tripped through libxml + `dom-print'.
 Handles inline elements correctly.  Requires Emacs built with
 libxml2 support (true for mainstream distros, macOS Homebrew,
-and Windows GNU builds)."
+and Windows GNU builds).  Post-processes <pre><code> blocks to
+remove indentation that would otherwise print as a leading gap."
   (unless (fboundp 'libxml-parse-html-region)
     (error "orgsite: libxml2 support required for `libxml' format"))
   (with-temp-buffer
@@ -601,7 +774,7 @@ and Windows GNU builds)."
       (erase-buffer)
       (insert "<!DOCTYPE html>\n")
       (dom-print dom t)
-      (buffer-string))))
+      (orgsite--format-libxml-fix-pre (buffer-string)))))
 
 (defun orgsite--format-html (html)
   "Dispatch HTML through the formatter chosen by `orgsite-output-format'.
@@ -629,27 +802,45 @@ configuration never drops output on the floor."
   (mapcar #'orgsite-page-load sources))
 
 (defun orgsite--generate-synthetic (pages)
-  "Return PAGES with any synthetic pages appended.
-Calls every function on `orgsite-synthetic-pages-functions' with
-the loaded PAGES list.  Each function returns a (possibly empty)
-list of extra `orgsite-page' structs, all of which are appended
-to PAGES.  Use this to build blog listings, archives, category
-pages, feeds --- anything site-specific."
-  (let ((extras (mapcan (lambda (fn) (funcall fn pages))
-                        orgsite-synthetic-pages-functions)))
-    (append pages extras)))
+  "Return PAGES with every synthetic page appended.
+Three sources:
+
+  1. User hook functions on `orgsite-synthetic-pages-functions'
+     (listings, archives, category pages, custom feeds...).
+  2. Auto-registered sitemap + RSS from `orgsite--auto-synthetic-pages'
+     (toggled by `orgsite-generate-sitemap' / `-generate-rss').
+
+Auto-registered pages see the full post list, so they happen AFTER
+user hooks --- that way user-produced synthetic pages also get
+indexed in the sitemap."
+  (let* ((with-user-extras
+          (append pages
+                  (mapcan (lambda (fn) (funcall fn pages))
+                          orgsite-synthetic-pages-functions)))
+         (auto (orgsite--auto-synthetic-pages with-user-extras)))
+    (append with-user-extras auto)))
 
 (defun orgsite--render-pages (pages)
   "Fill the BODY slot of each page in PAGES."
   (mapc #'orgsite-render-page pages))
 
 (defun orgsite--write-page (page)
-  "Wrap PAGE in its layout, format, and write it to disk."
-  (let ((out (orgsite-page-output-path page))
-        (html (orgsite--format-html (orgsite-template-wrap page))))
+  "Write PAGE to disk.
+Regular pages are wrapped in their layout and run through the
+formatter.  Pages with the RAW slot set are written verbatim ---
+no layout, no HTML formatter --- which is what XML artefacts like
+sitemaps and feeds need."
+  (let* ((out (orgsite-page-output-path page))
+         (body (if (orgsite-page-raw page)
+                   (or (orgsite-page-body page) "")
+                 (orgsite--format-html (orgsite-template-wrap page))))
+         ;; Force UTF-8 so XML artefacts with chars outside the
+         ;; default system coding don't trigger an interactive prompt
+         ;; in batch mode.
+         (coding-system-for-write 'utf-8-unix))
     (make-directory (file-name-directory out) t)
     (with-temp-file out
-      (insert html))
+      (insert body))
     (message "  wrote %s" (file-relative-name out orgsite-output-dir))))
 
 (defun orgsite--write-pages (pages)
