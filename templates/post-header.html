@@ -1,0 +1,7 @@
+<header class="page-header">
+  <h1>@(orgsite--escape (orgsite-page-title page))</h1>
+  @(when (and (orgsite-page-is-post-p page) (orgsite-page-date page))
+     (format "<time datetime=\"%s\">%s</time>"
+             (orgsite-page-date page)
+             (orgsite-page-date page)))
+</header>

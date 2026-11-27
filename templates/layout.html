@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html lang="en">
+@(orgsite--head page)
+  <body>
+    @(orgsite-partial "nav.html" page)
+    <main id="content">
+      @(orgsite-partial "post-header.html" page)
+      <article class="post-body">
+        @(orgsite-page-body page)
+      </article>
+    </main>
+    @(orgsite-partial "footer.html" page)
+  </body>
+</html>

@@ -1,0 +1,13 @@
+# Byte-compiled
+*.elc
+
+# Emacs backups and temp files
+*~
+\#*\#
+.\#*
+
+# Local editor state
+.dir-locals.el
+
+# Build artifacts (for example sites built from inside the repo)
+dist/
