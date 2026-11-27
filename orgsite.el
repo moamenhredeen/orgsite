@@ -113,6 +113,15 @@ list of additional `orgsite-page' structs (possibly empty).
 Called after loading, before rendering.  Use this to build
 listings, archives, category indexes, feeds, etc.")
 
+(defvar orgsite-pre-build-hook nil
+  "Normal hook run before every `orgsite-build'.
+Useful for cleaning the output dir, compiling Tailwind, running
+a formatter over content, etc.")
+
+(defvar orgsite-post-build-hook nil
+  "Normal hook run after every successful `orgsite-build'.
+Useful for deploy steps (rsync, wrangler, vercel, s3 sync).")
+
 ;;; --------------------------------------- sitemap + RSS auto-generation
 
 (defvar orgsite-generate-sitemap t
@@ -133,7 +142,8 @@ Default puts it at the site root; set to e.g. \"blog/rss.xml\" to
 place it under a section.")
 
 (defvar orgsite-rss-limit 20
-  "Maximum number of items included in the auto-generated RSS feed.")
+  "Maximum number of items included in the auto-generated RSS feed.
+Set to nil for no cap.")
 
 (defvar orgsite-rss-filter
   (lambda (p) (eq (orgsite-page-layout p) 'post))
@@ -747,12 +757,13 @@ valid for strict validators."
 Honours `orgsite-rss-filter', `orgsite-rss-limit', and
 `orgsite-rss-output'."
   (let* ((candidates (seq-filter orgsite-rss-filter pages))
-         (posts (seq-take
-                 (orgsite-sort-by-date
+         (sorted (orgsite-sort-by-date
                   (seq-remove (lambda (p)
                                 (equal (orgsite-page-status p) "draft"))
-                              candidates))
-                 orgsite-rss-limit))
+                              candidates)))
+         (posts (if orgsite-rss-limit
+                    (seq-take sorted orgsite-rss-limit)
+                  sorted))
          (items (mapconcat #'orgsite--rss-item posts "\n"))
          (feed-link (concat orgsite-site-url
                             "/" (or (file-name-directory orgsite-rss-output)
@@ -1135,15 +1146,98 @@ address."
     (message "orgsite: not running")))
 
 
+;;;; ============================================================= Watch
+
+;; Auto-rebuild on content / template / asset changes.  Uses the
+;; built-in `filenotify' library so there's no extra dependency.
+;; Rebuilds are debounced --- a burst of saves (e.g. an editor doing
+;; a swap-file dance) triggers a single rebuild shortly after the
+;; last event rather than N rebuilds in flight.
+
+(require 'filenotify)
+
+(defvar orgsite-watch-debounce-seconds 0.5
+  "Seconds to wait after the last change before rebuilding.
+Smooths over editors that fire many events per save.")
+
+(defvar orgsite--watch-descriptors nil
+  "List of active file-notify descriptors.")
+
+(defvar orgsite--watch-timer nil
+  "Pending rebuild timer, or nil.")
+
+(defun orgsite--watch-rebuild ()
+  "Run a build + notify.  Called from the debounce timer."
+  (setq orgsite--watch-timer nil)
+  (condition-case err
+      (progn
+        (orgsite-build)
+        (message "orgsite-watch: rebuilt at %s"
+                 (format-time-string "%H:%M:%S")))
+    (error
+     (message "orgsite-watch: build failed: %s"
+              (error-message-string err)))))
+
+(defun orgsite--watch-callback (_event)
+  "File-notify handler: debounce, then rebuild."
+  (when orgsite--watch-timer
+    (cancel-timer orgsite--watch-timer))
+  (setq orgsite--watch-timer
+        (run-at-time orgsite-watch-debounce-seconds nil
+                     #'orgsite--watch-rebuild)))
+
+(defun orgsite--watch-add (dir)
+  "Recursively watch DIR for content / write events."
+  (when (file-directory-p dir)
+    (push (file-notify-add-watch
+           dir '(change) #'orgsite--watch-callback)
+          orgsite--watch-descriptors)
+    ;; file-notify-add-watch is NOT recursive on every backend, so
+    ;; register every subdirectory explicitly.
+    (dolist (sub (directory-files dir t "^[^.]"))
+      (when (file-directory-p sub)
+        (orgsite--watch-add sub)))))
+
+;;;###autoload
+(defun orgsite-watch ()
+  "Start watching content / templates / assets and rebuild on change.
+Idempotent: if already watching, prints the current status."
+  (interactive)
+  (if orgsite--watch-descriptors
+      (message "orgsite-watch: already watching (%d descriptors)"
+               (length orgsite--watch-descriptors))
+    (dolist (dir (list orgsite-content-dir
+                       orgsite-templates-dir
+                       orgsite-assets-dir
+                       orgsite-public-dir))
+      (orgsite--watch-add dir))
+    (message "orgsite-watch: watching %d dirs; rebuild on save"
+             (length orgsite--watch-descriptors))))
+
+;;;###autoload
+(defun orgsite-watch-stop ()
+  "Stop watching and cancel any pending rebuild."
+  (interactive)
+  (dolist (desc orgsite--watch-descriptors)
+    (ignore-errors (file-notify-rm-watch desc)))
+  (setq orgsite--watch-descriptors nil)
+  (when orgsite--watch-timer
+    (cancel-timer orgsite--watch-timer)
+    (setq orgsite--watch-timer nil))
+  (message "orgsite-watch: stopped"))
+
+
 ;;;; ============================================================== Main
 
 ;;;###autoload
 (defun orgsite-build ()
   "Build the entire site into `orgsite-output-dir'.
+Runs `orgsite-pre-build-hook' before loading content, and
+`orgsite-post-build-hook' after writing is complete.
 Idempotent: existing files are overwritten.  Obsolete files are
-left behind --- clean the output dir between runs if that
-matters."
+left behind --- call `orgsite-clean' first if that matters."
   (interactive)
+  (run-hooks 'orgsite-pre-build-hook)
   (message "orgsite: building into %s" orgsite-output-dir)
   (make-directory orgsite-output-dir t)
   (let* ((sources (orgsite--discover-sources))
@@ -1161,7 +1255,23 @@ matters."
     (orgsite--copy-assets)
     (orgsite--copy-public)
     (orgsite--copy-content-assets)
-    (message "orgsite: built %d page(s)" (length all))))
+    (message "orgsite: built %d page(s)" (length all)))
+  (run-hooks 'orgsite-post-build-hook))
+
+;;;###autoload
+(defun orgsite-clean ()
+  "Delete the output directory so the next build starts from scratch.
+Removes obsolete files left behind by renames or deletions.
+Prompts for confirmation when called interactively."
+  (interactive)
+  (if (not (file-directory-p orgsite-output-dir))
+      (message "orgsite: nothing to clean (%s does not exist)"
+               orgsite-output-dir)
+    (when (or (not (called-interactively-p 'any))
+              (yes-or-no-p (format "orgsite: delete %s? "
+                                   orgsite-output-dir)))
+      (delete-directory orgsite-output-dir t)
+      (message "orgsite: cleaned %s" orgsite-output-dir))))
 
 (provide 'orgsite)
 ;;; orgsite.el ends here
