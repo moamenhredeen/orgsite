@@ -1161,11 +1161,87 @@ STATUS is a string like \"200 OK\".  HEADERS is an alist of
    (format "<!doctype html><title>404</title><h1>404 Not Found</h1><p>%s</p>"
            url-path)))
 
+;;; --- Live reload (Server-Sent Events) ------------------------------
+
+(defvar orgsite-serve-live-reload t
+  "When non-nil, the dev server injects a reload script into every
+HTML response and broadcasts `reload' events on
+`orgsite-post-build-hook'.  Set to nil to disable.")
+
+(defconst orgsite--livereload-path "/__orgsite__/events"
+  "URL the injected client listens on for reload events.")
+
+(defconst orgsite--livereload-script
+  "<script>
+(() => {
+  if (window.__orgsiteLive) return;
+  window.__orgsiteLive = true;
+  const es = new EventSource('/__orgsite__/events');
+  es.onmessage = (e) => { if (e.data === 'reload') location.reload(); };
+})();
+</script>"
+  "Tiny client script injected before </body> in HTML responses.")
+
+(defvar orgsite--sse-clients nil
+  "List of processes currently holding an SSE connection.")
+
+(defvar orgsite--sse-ping-timer nil
+  "Timer that pings each SSE client periodically to keep them alive.")
+
+(defun orgsite--sse-broadcast (payload)
+  "Send PAYLOAD as a single SSE `data:' event to every open client.
+Dead processes are pruned opportunistically."
+  (let ((msg (format "data: %s\n\n" payload)))
+    (dolist (p (copy-sequence orgsite--sse-clients))
+      (if (process-live-p p)
+          (ignore-errors (process-send-string p msg))
+        (setq orgsite--sse-clients (delq p orgsite--sse-clients))))))
+
+(defun orgsite--sse-ping ()
+  "Send a comment line to each client.  Keeps idle connections open."
+  (dolist (p (copy-sequence orgsite--sse-clients))
+    (if (process-live-p p)
+        (ignore-errors (process-send-string p ": ping\n\n"))
+      (setq orgsite--sse-clients (delq p orgsite--sse-clients)))))
+
+(defun orgsite--sse-attach (proc)
+  "Promote PROC to a long-lived SSE connection."
+  (process-send-string
+   proc
+   (concat "HTTP/1.0 200 OK\r\n"
+           "Content-Type: text/event-stream\r\n"
+           "Cache-Control: no-cache\r\n"
+           "Connection: keep-alive\r\n\r\n"
+           ": connected\n\n"))
+  (push proc orgsite--sse-clients)
+  (set-process-sentinel
+   proc
+   (lambda (p _event)
+     (setq orgsite--sse-clients (delq p orgsite--sse-clients)))))
+
+(defun orgsite--serve-livereload-post-build ()
+  "Broadcast a reload event; registered on `orgsite-post-build-hook'."
+  (orgsite--sse-broadcast "reload"))
+
+(defun orgsite--inject-livereload (body)
+  "Splice the client script before </body> in BODY, or return as-is."
+  (if (string-match "</body>" body)
+      (replace-match (concat orgsite--livereload-script "</body>") t t body)
+    body))
+
+;;; --- Regular file serving --------------------------------------------
+
 (defun orgsite--serve-file (proc url-path file)
-  "Send FILE in response to URL-PATH on PROC."
+  "Send FILE in response to URL-PATH on PROC.
+HTML responses get the live-reload script spliced before </body>
+when `orgsite-serve-live-reload' is non-nil."
   (orgsite--serve-log "200 %s" url-path)
-  (let ((body (orgsite--serve-read-binary file))
-        (mime (orgsite--mime-for file)))
+  (let* ((body (orgsite--serve-read-binary file))
+         (mime (orgsite--mime-for file))
+         (body (if (and orgsite-serve-live-reload
+                        (string-prefix-p "text/html" mime))
+                   (orgsite--inject-livereload body)
+                 body)))
     (orgsite--serve-send proc "200 OK"
                          (list (cons "Content-Type" mime))
                          body)))
@@ -1183,13 +1259,21 @@ STATUS is a string like \"200 OK\".  HEADERS is an alist of
         ;; Request still incoming --- stash and wait.
         (process-put proc 'orgsite-buf buf)
       (let ((url-path (orgsite--serve-parse-path buf)))
-        (if (null url-path)
-            (orgsite--serve-send proc "400 Bad Request" nil "")
+        (cond
+         ((null url-path)
+          (orgsite--serve-send proc "400 Bad Request" nil "")
+          (ignore-errors (delete-process proc)))
+         ;; SSE endpoint: keep the connection open --- do NOT delete-process.
+         ((and orgsite-serve-live-reload
+               (string= url-path orgsite--livereload-path))
+          (orgsite--serve-log "SSE open")
+          (orgsite--sse-attach proc))
+         (t
           (let ((file (orgsite--serve-resolve url-path)))
             (if file
                 (orgsite--serve-file proc url-path file)
-              (orgsite--serve-404 proc url-path))))
-        (ignore-errors (delete-process proc))))))
+              (orgsite--serve-404 proc url-path)))
+          (ignore-errors (delete-process proc))))))))
 
 ;;;###autoload
 (defun orgsite-serve ()
@@ -1213,6 +1297,13 @@ address."
            :coding '(binary . binary)
            :filter #'orgsite--serve-filter
            :log (lambda (_server _client _msg) nil)))
+    (when orgsite-serve-live-reload
+      ;; Keep idle SSE connections alive and broadcast reloads after
+      ;; every build.
+      (setq orgsite--sse-ping-timer
+            (run-at-time 15 15 #'orgsite--sse-ping))
+      (add-hook 'orgsite-post-build-hook
+                #'orgsite--serve-livereload-post-build))
     (message "orgsite: serving %s at http://%s:%d/  (M-x orgsite-serve-stop)"
              orgsite-output-dir orgsite-serve-host orgsite-serve-port)))
 
@@ -1220,6 +1311,15 @@ address."
 (defun orgsite-serve-stop ()
   "Stop the dev server, if any."
   (interactive)
+  ;; Tear down SSE state first.
+  (remove-hook 'orgsite-post-build-hook
+               #'orgsite--serve-livereload-post-build)
+  (when orgsite--sse-ping-timer
+    (cancel-timer orgsite--sse-ping-timer)
+    (setq orgsite--sse-ping-timer nil))
+  (dolist (p orgsite--sse-clients)
+    (ignore-errors (delete-process p)))
+  (setq orgsite--sse-clients nil)
   (if (and orgsite--server-process
            (process-live-p orgsite--server-process))
       (progn
